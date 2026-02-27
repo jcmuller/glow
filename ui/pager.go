@@ -105,12 +105,12 @@ type pagerModel struct {
 	watcher *fsnotify.Watcher
 
 	// Slide navigation: track slides and current position
-	slides             []string // Each slide's markdown content
-	currentSlide       int      // Current slide index (0-based)
-	slideMode          bool     // Whether we're in slide presentation mode
-	originalContent    string   // Full document content
-	renderedContent    string   // For backwards compatibility
-	resetScrollPosition bool    // Track if we should reset scroll position on next render
+	slides              []string // Each slide's markdown content
+	currentSlide        int      // Current slide index (0-based)
+	slideMode           bool     // Whether we're in slide presentation mode
+	originalContent     string   // Full document content
+	renderedContent     string   // For backwards compatibility
+	resetScrollPosition bool     // Track if we should reset scroll position on next render
 }
 
 func newPagerModel(common *commonModel) pagerModel {
@@ -258,12 +258,12 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
 
-		case "n", "right":
+		case "n", "right", keySpace:
 			if cmd := m.nextPage(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
 
-		case "p", "left":
+		case "p", "left", "backspace":
 			if cmd := m.previousPage(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}

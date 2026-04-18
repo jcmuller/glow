@@ -2,15 +2,18 @@ package ui
 
 // Config contains TUI-specific configuration.
 type Config struct {
-	ShowAllFiles     bool
-	ShowLineNumbers  bool
-	Gopath           string `env:"GOPATH"`
-	HomeDir          string `env:"HOME"`
-	GlamourMaxWidth  uint
-	GlamourStyle     string `env:"GLAMOUR_STYLE"`
-	EnableMouse      bool
-	PreserveNewLines bool
-	PresentationMode bool
+	ShowAllFiles      bool
+	ShowLineNumbers   bool
+	Gopath            string `env:"GOPATH"`
+	HomeDir           string `env:"HOME"`
+	GlamourMaxWidth   uint
+	GlamourStyle      string `env:"GLAMOUR_STYLE"`
+	EnableMouse       bool
+	PreserveNewLines  bool
+	PresentationMode  bool
+	SpeakerPresenter  bool
+	SpeakerViewer     bool
+	SpeakerSocketPath string
 
 	// Working directory or file path
 	Path string

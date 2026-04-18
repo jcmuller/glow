@@ -179,10 +179,44 @@ type speakerServer struct {
 	hasState  bool
 }
 
+// viewerConn wraps one accepted connection. Writes go through the
+// writer goroutine via publish(), so a peer that stops draining its
+// socket cannot stall the presenter's key handler.
 type viewerConn struct {
 	c      net.Conn
 	enc    *json.Encoder
 	bucket *tokenBucket
+
+	mu       sync.Mutex
+	pending  *stateMsg
+	signal   chan struct{}
+	writerCh chan struct{} // closed when writeLoop exits
+}
+
+// publish queues st for delivery. Latest-state-wins: if an older state
+// is still pending, publish replaces it in place. The writer goroutine
+// picks up whatever is current when it wakes up.
+func (vc *viewerConn) publish(st stateMsg) {
+	vc.mu.Lock()
+	vc.pending = &st
+	vc.mu.Unlock()
+	select {
+	case vc.signal <- struct{}{}:
+	default:
+	}
+}
+
+// take returns and clears any pending state, or (_, false) if nothing
+// is waiting.
+func (vc *viewerConn) take() (stateMsg, bool) {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.pending == nil {
+		return stateMsg{}, false
+	}
+	st := *vc.pending
+	vc.pending = nil
+	return st, true
 }
 
 func startSpeakerServer(path string) (*speakerServer, error) {
@@ -221,23 +255,46 @@ func (s *speakerServer) acceptLoop() {
 			continue
 		}
 		vc := &viewerConn{
-			c:      c,
-			enc:    json.NewEncoder(c),
-			bucket: newTokenBucket(speakerAdvanceRate, speakerAdvanceBurst),
+			c:        c,
+			enc:      json.NewEncoder(c),
+			bucket:   newTokenBucket(speakerAdvanceRate, speakerAdvanceBurst),
+			signal:   make(chan struct{}, 1),
+			writerCh: make(chan struct{}),
 		}
 		s.conns[vc] = struct{}{}
-		// Replay the last state so a newly connected viewer lands on
-		// the current slide without waiting for the next advance.
 		replay, ok := s.lastState, s.hasState
 		s.mu.Unlock()
+		go s.writeLoop(vc)
 		if ok {
-			if err := vc.enc.Encode(replay); err != nil {
-				log.Debug("speaker: replay encode failed", "error", err)
-				s.dropConn(vc)
-				continue
-			}
+			vc.publish(replay)
 		}
 		go s.readLoop(vc)
+	}
+}
+
+// writeLoop owns all writes to a viewer. It wakes on vc.signal, picks
+// up whatever is pending, and Encodes it. When the socket closes or
+// Encode errors, it drops the connection and exits.
+func (s *speakerServer) writeLoop(vc *viewerConn) {
+	defer close(vc.writerCh)
+	for {
+		select {
+		case <-s.done:
+			return
+		case _, ok := <-vc.signal:
+			if !ok {
+				return
+			}
+		}
+		st, has := vc.take()
+		if !has {
+			continue
+		}
+		if err := vc.enc.Encode(st); err != nil {
+			log.Debug("speaker: broadcast encode failed", "error", err)
+			s.dropConn(vc)
+			return
+		}
 	}
 }
 
@@ -273,8 +330,10 @@ func (s *speakerServer) dropConn(vc *viewerConn) {
 	_ = vc.c.Close()
 }
 
-// Broadcast sends st to every connected viewer and caches it for
-// replay on the next connect.
+// Broadcast caches st and hands it to every connected viewer's writer
+// goroutine. Never blocks on a slow peer: per-conn writes are async
+// and "latest state wins," so a stuck viewer only loses intermediate
+// updates.
 func (s *speakerServer) Broadcast(st stateMsg) {
 	s.mu.Lock()
 	s.lastState = st
@@ -285,10 +344,7 @@ func (s *speakerServer) Broadcast(st stateMsg) {
 	}
 	s.mu.Unlock()
 	for _, vc := range targets {
-		if err := vc.enc.Encode(st); err != nil {
-			log.Debug("speaker: broadcast encode failed", "error", err)
-			s.dropConn(vc)
-		}
+		vc.publish(st)
 	}
 }
 
@@ -317,14 +373,18 @@ func (s *speakerServer) Close() error {
 	return nil
 }
 
-// speakerClient is the viewer side. It sends advance requests via
-// SendAdvance and exposes the presenter's state frames on States.
+// speakerClient is the viewer side. Reads go through a background
+// goroutine; writes go through an outbox channel so a stuck presenter
+// cannot stall the local key handler.
 type speakerClient struct {
 	c      net.Conn
 	enc    *json.Encoder
 	states chan stateMsg
+	outbox chan advanceMsg
 	done   chan struct{}
 }
+
+const speakerOutboxSize = 16
 
 func dialSpeaker(path string) (*speakerClient, error) {
 	c, err := net.DialTimeout("unix", path, 2*speakerDialTimeout)
@@ -335,10 +395,29 @@ func dialSpeaker(path string) (*speakerClient, error) {
 		c:      c,
 		enc:    json.NewEncoder(c),
 		states: make(chan stateMsg, 8),
+		outbox: make(chan advanceMsg, speakerOutboxSize),
 		done:   make(chan struct{}),
 	}
 	go cl.readLoop()
+	go cl.writeLoop()
 	return cl, nil
+}
+
+// writeLoop drains the outbox and encodes to the socket. On any write
+// error the loop exits; subsequent SendAdvance calls will still queue
+// into a full outbox and be dropped, so they never block either.
+func (cl *speakerClient) writeLoop() {
+	for {
+		select {
+		case <-cl.done:
+			return
+		case m := <-cl.outbox:
+			if err := cl.enc.Encode(m); err != nil {
+				log.Debug("viewer: send encode failed", "error", err)
+				return
+			}
+		}
+	}
 }
 
 func (cl *speakerClient) readLoop() {
@@ -359,8 +438,16 @@ func (cl *speakerClient) readLoop() {
 }
 
 // SendAdvance asks the presenter to move in dir ("next" or "prev").
+// The call is non-blocking: if the outbox is full (a stuck presenter)
+// the request is dropped so the viewer's key handler stays responsive.
 func (cl *speakerClient) SendAdvance(dir string) error {
-	return cl.enc.Encode(advanceMsg{Type: "advance", Dir: dir})
+	select {
+	case cl.outbox <- advanceMsg{Type: "advance", Dir: dir}:
+		return nil
+	default:
+		log.Debug("viewer: outbox full, dropping advance", "dir", dir)
+		return nil
+	}
 }
 
 // States returns the channel of incoming state frames from the presenter.

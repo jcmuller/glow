@@ -414,6 +414,97 @@ drain:
 	}
 }
 
+func TestBroadcastDoesNotStallOnStuckViewer(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path, err := speakerSocketPath("/fixtures/stuck-viewer.md")
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	srv, err := startSpeakerServer(path)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer srv.Close() //nolint:errcheck
+
+	// Raw unix dial that never reads. The server's write buffer will
+	// fill eventually; Broadcast must not block the caller.
+	c, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close() //nolint:errcheck
+
+	// Give the server's accept loop time to register the conn.
+	time.Sleep(50 * time.Millisecond)
+
+	payload := stateMsg{Type: "state", Index: 0, Total: 10000, Started: 1}
+
+	done := make(chan struct{})
+	go func() {
+		for range 20000 {
+			srv.Broadcast(payload)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: Broadcast returned for every call even though the
+		// peer never drained its socket.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broadcast stalled when the viewer stopped reading")
+	}
+}
+
+func TestSendAdvanceDoesNotStallOnStuckPresenter(t *testing.T) {
+	// Stand up a raw listener that accepts one conn and never reads.
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "stuck-presenter.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close() //nolint:errcheck
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- c
+	}()
+
+	cli, err := dialSpeaker(sockPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer cli.Close() //nolint:errcheck
+
+	var serverSide net.Conn
+	select {
+	case serverSide = <-accepted:
+		defer serverSide.Close() //nolint:errcheck
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("server never accepted")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for range 20000 {
+			_ = cli.SendAdvance("next")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success.
+	case <-time.After(2 * time.Second):
+		t.Fatal("SendAdvance stalled when the presenter stopped reading")
+	}
+}
+
 func TestTokenBucketBurstAndRefill(t *testing.T) {
 	b := newTokenBucket(10, 5)
 	allowed := 0

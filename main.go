@@ -39,6 +39,9 @@ var (
 	pager            bool
 	tui              bool
 	presentation     bool
+	presenter        bool
+	viewer           bool
+	socketPath       string
 	style            string
 	width            uint
 	showAllFiles     bool
@@ -175,6 +178,9 @@ func validateOptions(cmd *cobra.Command) error {
 	showAllFiles = viper.GetBool("all")
 	preserveNewLines = viper.GetBool("preserveNewLines")
 	showLineNumbers = viper.GetBool("showLineNumbers")
+	presenter = viper.GetBool("presenter")
+	viewer = viper.GetBool("viewer")
+	socketPath = viper.GetString("socket")
 
 	if pager && tui {
 		return errors.New("cannot use both pager and tui")
@@ -182,6 +188,14 @@ func validateOptions(cmd *cobra.Command) error {
 
 	if pager && presentation {
 		return errors.New("presentation mode cannot be used with pager mode")
+	}
+
+	if presenter && viewer {
+		return errors.New("--presenter and --viewer are mutually exclusive")
+	}
+
+	if (presenter || viewer) && !presentation {
+		presentation = true
 	}
 
 	if presentation && !tui {
@@ -375,6 +389,9 @@ func runTUI(path string, content string) error {
 	cfg.EnableMouse = mouse
 	cfg.PreserveNewLines = preserveNewLines
 	cfg.PresentationMode = presentation
+	cfg.SpeakerPresenter = presenter
+	cfg.SpeakerViewer = viewer
+	cfg.SpeakerSocketPath = socketPath
 
 	// Run Bubble Tea program
 	if _, err := ui.NewProgram(cfg, content).Run(); err != nil {
@@ -414,6 +431,9 @@ func init() {
 	rootCmd.Flags().BoolVarP(&pager, "pager", "p", false, "display with pager")
 	rootCmd.Flags().BoolVarP(&tui, "tui", "t", false, "display with tui")
 	rootCmd.Flags().BoolVarP(&presentation, "presentation", "P", false, "display in presentation mode (TUI-mode only)")
+	rootCmd.Flags().BoolVar(&presenter, "presenter", false, "run as the presentation server for a speaker view (implies -P)")
+	rootCmd.Flags().BoolVar(&viewer, "viewer", false, "run as a speaker view that follows a --presenter instance (implies -P)")
+	rootCmd.Flags().StringVar(&socketPath, "socket", "", "explicit unix socket path for --presenter/--viewer (default: auto-derived from the file)")
 	rootCmd.Flags().StringVarP(&style, "style", "s", styles.AutoStyle, "style name or JSON path")
 	rootCmd.Flags().UintVarP(&width, "width", "w", 0, "word-wrap at width (set to 0 to disable)")
 	rootCmd.Flags().BoolVarP(&showAllFiles, "all", "a", false, "show system files and directories (TUI-mode only)")
@@ -426,6 +446,9 @@ func init() {
 	_ = viper.BindPFlag("pager", rootCmd.Flags().Lookup("pager"))
 	_ = viper.BindPFlag("tui", rootCmd.Flags().Lookup("tui"))
 	_ = viper.BindPFlag("presentation", rootCmd.Flags().Lookup("presentation"))
+	_ = viper.BindPFlag("presenter", rootCmd.Flags().Lookup("presenter"))
+	_ = viper.BindPFlag("viewer", rootCmd.Flags().Lookup("viewer"))
+	_ = viper.BindPFlag("socket", rootCmd.Flags().Lookup("socket"))
 	_ = viper.BindPFlag("style", rootCmd.Flags().Lookup("style"))
 	_ = viper.BindPFlag("width", rootCmd.Flags().Lookup("width"))
 	_ = viper.BindPFlag("debug", rootCmd.Flags().Lookup("debug"))

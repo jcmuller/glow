@@ -281,7 +281,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Render the first slide if in slide mode, otherwise render full content
 		if m.pager.slideMode && len(m.pager.slides) > 0 {
-			cmds = append(cmds, renderWithGlamour(m.pager, m.pager.slides[0]))
+			cmds = append(cmds, renderWithGlamour(m.pager, m.pager.slides[0].body))
 		} else {
 			cmds = append(cmds, renderWithGlamour(m.pager, body))
 		}

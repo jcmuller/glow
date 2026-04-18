@@ -82,6 +82,13 @@ type (
 	reloadMsg          struct{}
 )
 
+// slide is one slide's rendered body and any speaker notes that
+// followed a bare `???` line in the source.
+type slide struct {
+	body  string
+	notes string
+}
+
 type pagerState int
 
 const (
@@ -105,12 +112,12 @@ type pagerModel struct {
 	watcher *fsnotify.Watcher
 
 	// Slide navigation: track slides and current position
-	slides              []string // Each slide's markdown content
-	currentSlide        int      // Current slide index (0-based)
-	slideMode           bool     // Whether we're in slide presentation mode
-	originalContent     string   // Full document content
-	renderedContent     string   // For backwards compatibility
-	resetScrollPosition bool     // Track if we should reset scroll position on next render
+	slides              []slide // Each slide's body + optional speaker notes
+	currentSlide        int     // Current slide index (0-based)
+	slideMode           bool    // Whether we're in slide presentation mode
+	originalContent     string  // Full document content
+	renderedContent     string  // For backwards compatibility
+	resetScrollPosition bool    // Track if we should reset scroll position on next render
 }
 
 func newPagerModel(common *commonModel) pagerModel {
@@ -312,7 +319,7 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 
 		// Render the current slide if in slide mode, otherwise full content
 		if m.slideMode && len(m.slides) > 0 {
-			return m, renderWithGlamour(m, m.slides[m.currentSlide])
+			return m, renderWithGlamour(m, m.slides[m.currentSlide].body)
 		}
 		return m, renderWithGlamour(m, m.currentDocument.Body)
 
@@ -463,67 +470,184 @@ func (m pagerModel) helpView() (s string) {
 	return helpViewStyle(s)
 }
 
-// parseSlides splits the markdown into individual slides based on numbered H1 headers.
-// Each slide contains one H1 header and all content until the next H1 header.
-// Only activates if PresentationMode is enabled in config.
+// parseSlides runs splitSlides against the current document body and
+// flips the model into slide mode when slides came back.
 func (m *pagerModel) parseSlides() {
-	m.slides = []string{}
+	m.slides = nil
 	m.slideMode = false
 
-	// Only parse slides if presentation mode is enabled
 	if !m.common.cfg.PresentationMode {
 		return
 	}
-
 	if m.currentDocument.Body == "" {
 		return
 	}
 
-	lines := strings.Split(m.currentDocument.Body, "\n")
-	var currentSlideLines []string
-	foundNumberedH1 := false
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Check if this is a numbered H1 header
-		isNumberedH1 := false
-		if after, ok := strings.CutPrefix(trimmed, "# "); ok {
-			headerText := after
-			headerText = strings.TrimSpace(headerText)
-
-			// Check if it starts with a number
-			if len(headerText) > 0 && headerText[0] >= '0' && headerText[0] <= '9' {
-				isNumberedH1 = true
-				foundNumberedH1 = true
-			}
-		}
-
-		// If we hit a new numbered H1 and we have accumulated content, save the slide
-		if isNumberedH1 && len(currentSlideLines) > 0 {
-			m.slides = append(m.slides, strings.Join(currentSlideLines, "\n"))
-			currentSlideLines = []string{}
-		}
-
-		// Add line to current slide if we're in slide mode
-		if foundNumberedH1 {
-			currentSlideLines = append(currentSlideLines, line)
-		}
-	}
-
-	// Don't forget the last slide
-	if len(currentSlideLines) > 0 {
-		m.slides = append(m.slides, strings.Join(currentSlideLines, "\n"))
-	}
-
+	m.slides = splitSlides(m.currentDocument.Body)
 	if len(m.slides) > 0 {
 		m.slideMode = true
 		m.currentSlide = 0
 		m.originalContent = m.currentDocument.Body
 		log.Info("slide mode enabled", "slides", len(m.slides))
 	} else {
-		log.Debug("no numbered h1 headers found - slide mode disabled")
+		log.Debug("no slide separators found - slide mode disabled")
 	}
+}
+
+// splitSlides breaks a markdown body into slides. A bare `---` line
+// outside a fenced code block switches on thematic-break mode; with no
+// such line, splitSlides falls back to splitting on numbered H1
+// headers (`# 1. Foo`, `# 2. Bar`), discarding any preamble before the
+// first numbered header. Each slide has its speaker notes, introduced
+// by a bare `???` or `Notes:` line, moved into slide.notes.
+func splitSlides(body string) []slide {
+	if body == "" {
+		return nil
+	}
+
+	lines := strings.Split(body, "\n")
+
+	var bodies []string
+	if hasThematicBreak(lines) {
+		bodies = splitOnThematicBreaks(lines)
+	} else {
+		bodies = splitOnNumberedH1(lines)
+	}
+
+	if len(bodies) == 0 {
+		return nil
+	}
+
+	out := make([]slide, 0, len(bodies))
+	for _, b := range bodies {
+		bodyPart, notesPart := extractNotes(b)
+		out = append(out, slide{body: bodyPart, notes: notesPart})
+	}
+	return out
+}
+
+// isFenceLine reports whether a trimmed line opens or closes a fenced
+// code block (``` or ~~~, 3+ chars, optionally with an info string).
+func isFenceLine(trimmed string) bool {
+	return strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")
+}
+
+func hasThematicBreak(lines []string) bool {
+	inFence := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if isFenceLine(trimmed) {
+			inFence = !inFence
+			continue
+		}
+		if !inFence && trimmed == "---" {
+			return true
+		}
+	}
+	return false
+}
+
+func splitOnThematicBreaks(lines []string) []string {
+	var result []string
+	var cur []string
+	inFence := false
+	flush := func() {
+		joined := joinTrimEmpty(cur)
+		if joined != "" {
+			result = append(result, joined)
+		}
+		cur = nil
+	}
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if isFenceLine(trimmed) {
+			inFence = !inFence
+			cur = append(cur, line)
+			continue
+		}
+		if !inFence && trimmed == "---" {
+			flush()
+			continue
+		}
+		cur = append(cur, line)
+	}
+	flush()
+	return result
+}
+
+// joinTrimEmpty joins lines with newline, discarding leading and
+// trailing lines whose trimmed content is empty.
+func joinTrimEmpty(lines []string) string {
+	start := 0
+	for start < len(lines) && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	end := len(lines)
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	if start >= end {
+		return ""
+	}
+	return strings.Join(lines[start:end], "\n")
+}
+
+// splitOnNumberedH1 preserves the original presentation-mode behavior:
+// any content before the first `# <digit>` header is discarded, and
+// each subsequent numbered H1 starts a new slide.
+func splitOnNumberedH1(lines []string) []string {
+	var result []string
+	var cur []string
+	foundFirst := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		isNumberedH1 := false
+		if after, ok := strings.CutPrefix(trimmed, "# "); ok {
+			headerText := strings.TrimSpace(after)
+			if len(headerText) > 0 && headerText[0] >= '0' && headerText[0] <= '9' {
+				isNumberedH1 = true
+				foundFirst = true
+			}
+		}
+		if isNumberedH1 && len(cur) > 0 {
+			result = append(result, strings.Join(cur, "\n"))
+			cur = nil
+		}
+		if foundFirst {
+			cur = append(cur, line)
+		}
+	}
+	if len(cur) > 0 {
+		result = append(result, strings.Join(cur, "\n"))
+	}
+	return result
+}
+
+// isNotesMarker recognizes the notes separators. A line whose trimmed
+// content is exactly `???` or exactly `Notes:` starts speaker notes.
+func isNotesMarker(trimmed string) bool {
+	return trimmed == "???" || trimmed == "Notes:"
+}
+
+// extractNotes splits a slide body at the first notes marker that sits
+// outside a fenced code block. The first marker wins, so any later
+// `???` or `Notes:` line is kept verbatim inside the notes.
+func extractNotes(body string) (string, string) {
+	lines := strings.Split(body, "\n")
+	inFence := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if isFenceLine(trimmed) {
+			inFence = !inFence
+			continue
+		}
+		if !inFence && isNotesMarker(trimmed) {
+			bodyOut := strings.TrimRight(strings.Join(lines[:i], "\n"), "\n")
+			notesOut := strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
+			return bodyOut, notesOut
+		}
+	}
+	return body, ""
 }
 
 // nextPage navigates to the next slide.
@@ -541,7 +665,7 @@ func (m *pagerModel) nextPage() tea.Cmd {
 		m.currentSlide++
 		m.resetScrollPosition = true
 		log.Debug("navigating to next slide", "slide", m.currentSlide+1, "total", len(m.slides))
-		return renderWithGlamour(*m, m.slides[m.currentSlide])
+		return renderWithGlamour(*m, m.slides[m.currentSlide].body)
 	}
 
 	log.Debug("already at last slide")
@@ -563,7 +687,7 @@ func (m *pagerModel) previousPage() tea.Cmd {
 		m.currentSlide--
 		m.resetScrollPosition = true
 		log.Debug("navigating to previous slide", "slide", m.currentSlide+1, "total", len(m.slides))
-		return renderWithGlamour(*m, m.slides[m.currentSlide])
+		return renderWithGlamour(*m, m.slides[m.currentSlide].body)
 	}
 
 	log.Debug("already at first slide")

@@ -286,6 +286,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, renderWithGlamour(m.pager, body))
 		}
 
+		// Start the speaker-view server or client if the user asked for one.
+		if cmd := m.pager.startSpeakerFromConfig(m.pager.currentDocument.localPath); cmd != nil {
+			cmds = append(cmds, cmd)
+			// The viewer's notes panel steals height from the viewport;
+			// rebuild sizes so the first render accounts for it.
+			m.pager.setSize(m.common.width, m.common.height)
+		}
+
 	case contentRenderedMsg:
 		m.state = stateShowDocument
 

@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	statusBarHeight = 1
-	lineNumberWidth = 4
+	statusBarHeight    = 1
+	lineNumberWidth    = 4
+	speakerNotesHeight = 6 // notes panel + next preview + timer in viewer mode
 )
 
 var (
@@ -118,6 +119,11 @@ type pagerModel struct {
 	originalContent     string  // Full document content
 	renderedContent     string  // For backwards compatibility
 	resetScrollPosition bool    // Track if we should reset scroll position on next render
+
+	// Speaker view: at most one of these is non-nil, per config.
+	speakerSrv *speakerServer
+	speakerCli *speakerClient
+	startedAt  time.Time // presenter start time; the viewer inherits from incoming state
 }
 
 func newPagerModel(common *commonModel) pagerModel {
@@ -144,6 +150,10 @@ func (m *pagerModel) setSize(w, h int) {
 			pagerHelpHeight = strings.Count(m.helpView(), "\n")
 		}
 		m.viewport.Height -= (statusBarHeight + pagerHelpHeight)
+	}
+
+	if m.common != nil && m.common.cfg.SpeakerViewer {
+		m.viewport.Height -= speakerNotesHeight
 	}
 }
 
@@ -198,6 +208,17 @@ func (m *pagerModel) unload() {
 	m.slideMode = false
 	m.currentSlide = 0
 	m.originalContent = ""
+
+	// Tear down speaker-view connections.
+	if m.speakerSrv != nil {
+		_ = m.speakerSrv.Close()
+		m.speakerSrv = nil
+	}
+	if m.speakerCli != nil {
+		_ = m.speakerCli.Close()
+		m.speakerCli = nil
+	}
+	m.startedAt = time.Time{}
 }
 
 func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
@@ -266,14 +287,28 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 			}
 
 		case "n", "right", keySpace:
+			if m.speakerCli != nil {
+				if err := m.speakerCli.SendAdvance("next"); err != nil {
+					log.Debug("viewer: send advance next failed", "error", err)
+				}
+				break
+			}
 			if cmd := m.nextPage(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
+			m.broadcastState()
 
 		case "p", "left", "backspace":
+			if m.speakerCli != nil {
+				if err := m.speakerCli.SendAdvance("prev"); err != nil {
+					log.Debug("viewer: send advance prev failed", "error", err)
+				}
+				break
+			}
 			if cmd := m.previousPage(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
+			m.broadcastState()
 		}
 
 	// Glow has rendered the content
@@ -325,6 +360,46 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 
 	case statusMessageTimeoutMsg:
 		m.state = pagerStateBrowse
+
+	case speakerAdvanceInMsg:
+		if m.speakerSrv == nil {
+			break
+		}
+		var navCmd tea.Cmd
+		switch msg.Dir {
+		case "next":
+			navCmd = m.nextPage()
+		case "prev":
+			navCmd = m.previousPage()
+		default:
+			log.Debug("speaker: unknown advance dir dropped", "dir", msg.Dir)
+		}
+		if navCmd != nil {
+			cmds = append(cmds, navCmd)
+		}
+		m.broadcastState()
+		cmds = append(cmds, waitForAdvanceCmd(m.speakerSrv))
+
+	case speakerStateInMsg:
+		if m.speakerCli == nil {
+			break
+		}
+		if msg.Started > 0 && m.startedAt.IsZero() {
+			m.startedAt = time.UnixMilli(msg.Started)
+		}
+		if msg.Index >= 0 && msg.Index < len(m.slides) && msg.Index != m.currentSlide {
+			m.currentSlide = msg.Index
+			m.resetScrollPosition = true
+			cmds = append(cmds, renderWithGlamour(m, m.slides[m.currentSlide].body))
+		}
+		cmds = append(cmds, waitForStateCmd(m.speakerCli))
+
+	case speakerTickMsg:
+		// Ticks re-trigger View() so the viewer's elapsed-time field
+		// refreshes once per second.
+		if m.speakerSrv != nil || m.speakerCli != nil {
+			cmds = append(cmds, speakerTickCmd())
+		}
 	}
 
 	m.viewport, cmd = m.viewport.Update(msg)
@@ -340,11 +415,48 @@ func (m pagerModel) View() string {
 	// Footer
 	m.statusBarView(&b)
 
+	if m.common.cfg.SpeakerViewer {
+		m.speakerNotesView(&b)
+	}
+
 	if m.showHelp {
 		fmt.Fprint(&b, "\n"+m.helpView())
 	}
 
 	return b.String()
+}
+
+// speakerNotesView appends the viewer-only panel with speaker notes,
+// a preview of the next slide's first line, and the elapsed clock.
+func (m pagerModel) speakerNotesView(b *strings.Builder) {
+	fmt.Fprint(b, "\n")
+	if !m.slideMode || len(m.slides) == 0 {
+		fmt.Fprint(b, "NOTES: (no slides loaded)")
+		return
+	}
+
+	notes := m.slides[m.currentSlide].notes
+	if notes == "" {
+		notes = "(no notes)"
+	}
+
+	nextLine := "(end)"
+	if m.currentSlide+1 < len(m.slides) {
+		if first, _, _ := strings.Cut(m.slides[m.currentSlide+1].body, "\n"); first != "" {
+			nextLine = first
+		}
+	}
+
+	elapsed := "--:--"
+	if !m.startedAt.IsZero() {
+		d := time.Since(m.startedAt)
+		if d < 0 {
+			d = 0
+		}
+		elapsed = fmt.Sprintf("%02d:%02d", int(d.Minutes()), int(d.Seconds())%60)
+	}
+
+	fmt.Fprintf(b, "NOTES: %s\nNEXT:  %s\nTIME:  %s", notes, nextLine, elapsed)
 }
 
 func (m pagerModel) statusBarView(b *strings.Builder) {
@@ -648,6 +760,108 @@ func extractNotes(body string) (string, string) {
 		}
 	}
 	return body, ""
+}
+
+// Inbound speaker-view messages route through the pager's existing
+// update loop as tea.Msg values.
+type (
+	speakerAdvanceInMsg advanceMsg
+	speakerStateInMsg   stateMsg
+	speakerTickMsg      struct{}
+)
+
+// currentStateMsg returns a wire frame describing this presenter's
+// current slide index.
+func (m *pagerModel) currentStateMsg() stateMsg {
+	started := m.startedAt.UnixMilli()
+	if m.startedAt.IsZero() {
+		started = 0
+	}
+	return stateMsg{
+		Type:    "state",
+		Index:   m.currentSlide,
+		Total:   len(m.slides),
+		Started: started,
+	}
+}
+
+// broadcastState sends the current slide index to every connected
+// viewer. No-op outside presenter mode.
+func (m *pagerModel) broadcastState() {
+	if m.speakerSrv == nil {
+		return
+	}
+	m.speakerSrv.Broadcast(m.currentStateMsg())
+}
+
+// startSpeakerFromConfig starts the presenter server or viewer client
+// per Config. The returned cmd pumps inbound wire messages and drives
+// the per-second timer tick.
+func (m *pagerModel) startSpeakerFromConfig(filePath string) tea.Cmd {
+	if !m.slideMode {
+		return nil
+	}
+	if !m.common.cfg.SpeakerPresenter && !m.common.cfg.SpeakerViewer {
+		return nil
+	}
+	path := m.common.cfg.SpeakerSocketPath
+	if path == "" {
+		p, err := speakerSocketPath(filePath)
+		if err != nil {
+			log.Error("speaker socket path", "error", err)
+			return nil
+		}
+		path = p
+	}
+	switch {
+	case m.common.cfg.SpeakerPresenter:
+		srv, err := startSpeakerServer(path)
+		if err != nil {
+			log.Error("speaker server start", "error", err)
+			return nil
+		}
+		m.speakerSrv = srv
+		m.startedAt = time.Now()
+		log.Info("speaker presenter listening", "socket", path)
+		m.broadcastState()
+		return tea.Batch(waitForAdvanceCmd(srv), speakerTickCmd())
+	case m.common.cfg.SpeakerViewer:
+		cli, err := dialSpeaker(path)
+		if err != nil {
+			log.Error("speaker viewer dial", "error", err)
+			return nil
+		}
+		m.speakerCli = cli
+		log.Info("speaker viewer connected", "socket", path)
+		return tea.Batch(waitForStateCmd(cli), speakerTickCmd())
+	}
+	return nil
+}
+
+func waitForAdvanceCmd(srv *speakerServer) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-srv.Advances()
+		if !ok {
+			return nil
+		}
+		return speakerAdvanceInMsg(msg)
+	}
+}
+
+func waitForStateCmd(cli *speakerClient) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-cli.States()
+		if !ok {
+			return nil
+		}
+		return speakerStateInMsg(msg)
+	}
+}
+
+func speakerTickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return speakerTickMsg{}
+	})
 }
 
 // nextPage navigates to the next slide.

@@ -2,11 +2,21 @@ package ui
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// newTestPagerModel builds a pagerModel without calling newPagerModel
+// so tests avoid the fsnotify watcher and Bubble Tea program loop.
+func newTestPagerModel(cfg Config) pagerModel {
+	return pagerModel{
+		common:   &commonModel{cfg: cfg, width: 80, height: 24},
+		viewport: viewport.New(0, 0),
+	}
+}
 
 func TestPagerUpdateSlideNavigationKeys(t *testing.T) {
 	newModel := func(start int) pagerModel {
@@ -56,6 +66,74 @@ func TestPagerUpdateSlideNavigationKeys(t *testing.T) {
 			if prev.currentSlide != tc.want {
 				t.Errorf("currentSlide after %q = %d, want %d",
 					tc.key.String(), prev.currentSlide, tc.want)
+			}
+		})
+	}
+}
+
+func TestSetSizeReservesSpeakerNotesHeight(t *testing.T) {
+	const termH = 24
+	cases := []struct {
+		name string
+		cfg  Config
+		want int
+	}{
+		{
+			name: "presenter reserves notes height",
+			cfg:  Config{SpeakerPresenter: true},
+			want: termH - statusBarHeight - speakerNotesHeight,
+		},
+		{
+			name: "viewer does not reserve",
+			cfg:  Config{SpeakerViewer: true},
+			want: termH - statusBarHeight,
+		},
+		{
+			name: "neither reserves",
+			cfg:  Config{},
+			want: termH - statusBarHeight,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestPagerModel(tc.cfg)
+			m.setSize(80, termH)
+			if got := m.viewport.Height; got != tc.want {
+				t.Errorf("viewport.Height = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestViewSpeakerNotesPanelIsPresenterOnly(t *testing.T) {
+	build := func(cfg Config) pagerModel {
+		m := newTestPagerModel(cfg)
+		m.common.width = 40
+		m.common.height = 20
+		m.viewport = viewport.New(40, 10)
+		m.slides = []slide{{body: "# One", notes: "hello notes"}}
+		m.slideMode = true
+		return m
+	}
+
+	cases := []struct {
+		name      string
+		cfg       Config
+		wantPanel bool
+	}{
+		{"presenter shows notes panel", Config{SpeakerPresenter: true}, true},
+		{"viewer hides notes panel", Config{SpeakerViewer: true}, false},
+		{"neither hides notes panel", Config{}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := build(tc.cfg).View()
+			hasPanel := strings.Contains(out, "NOTES:")
+			if hasPanel != tc.wantPanel {
+				t.Errorf("NOTES panel visible = %v, want %v\noutput:\n%s",
+					hasPanel, tc.wantPanel, out)
 			}
 		})
 	}

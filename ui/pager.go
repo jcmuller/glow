@@ -152,7 +152,7 @@ func (m *pagerModel) setSize(w, h int) {
 		m.viewport.Height -= (statusBarHeight + pagerHelpHeight)
 	}
 
-	if m.common != nil && m.common.cfg.SpeakerViewer {
+	if m.common != nil && m.common.cfg.SpeakerPresenter {
 		m.viewport.Height -= speakerNotesHeight
 	}
 }
@@ -415,7 +415,7 @@ func (m pagerModel) View() string {
 	// Footer
 	m.statusBarView(&b)
 
-	if m.common.cfg.SpeakerViewer {
+	if m.common.cfg.SpeakerPresenter {
 		m.speakerNotesView(&b)
 	}
 
@@ -426,8 +426,9 @@ func (m pagerModel) View() string {
 	return b.String()
 }
 
-// speakerNotesView appends the viewer-only panel with speaker notes,
-// a preview of the next slide's first line, and the elapsed clock.
+// speakerNotesView appends the presenter-only panel with speaker
+// notes, a preview of the next slide's first line, and the elapsed
+// clock.
 func (m pagerModel) speakerNotesView(b *strings.Builder) {
 	fmt.Fprint(b, "\n")
 	if !m.slideMode || len(m.slides) == 0 {

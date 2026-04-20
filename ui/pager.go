@@ -103,6 +103,14 @@ type pagerModel struct {
 	currentDocument markdown
 
 	watcher *fsnotify.Watcher
+
+	// Slide navigation: track slides and current position
+	slides             []string // Each slide's markdown content
+	currentSlide       int      // Current slide index (0-based)
+	slideMode          bool     // Whether we're in slide presentation mode
+	originalContent    string   // Full document content
+	renderedContent    string   // For backwards compatibility
+	resetScrollPosition bool    // Track if we should reset scroll position on next render
 }
 
 func newPagerModel(common *commonModel) pagerModel {
@@ -134,6 +142,7 @@ func (m *pagerModel) setSize(w, h int) {
 
 func (m *pagerModel) setContent(s string) {
 	m.viewport.SetContent(s)
+	m.renderedContent = s
 }
 
 func (m *pagerModel) toggleHelp() {
@@ -176,6 +185,12 @@ func (m *pagerModel) unload() {
 	m.viewport.SetContent("")
 	m.viewport.YOffset = 0
 	m.unwatchFile()
+
+	// Reset slide mode
+	m.slides = nil
+	m.slideMode = false
+	m.currentSlide = 0
+	m.originalContent = ""
 }
 
 func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
@@ -242,6 +257,16 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 			if m.viewport.HighPerformanceRendering {
 				cmds = append(cmds, viewport.Sync(m.viewport))
 			}
+
+		case "n", "right":
+			if cmd := m.nextPage(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+
+		case "p", "left":
+			if cmd := m.previousPage(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	// Glow has rendered the content
@@ -249,6 +274,13 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 		log.Info("content rendered", "state", m.state)
 
 		m.setContent(string(msg))
+
+		// Reset scroll position if we just switched slides
+		if m.resetScrollPosition {
+			m.viewport.YOffset = 0
+			m.resetScrollPosition = false
+		}
+
 		if m.viewport.HighPerformanceRendering {
 			cmds = append(cmds, viewport.Sync(m.viewport))
 		}
@@ -256,17 +288,32 @@ func (m pagerModel) update(msg tea.Msg) (pagerModel, tea.Cmd) {
 
 	// The file was changed on disk and we're reloading it
 	case reloadMsg:
+		m.slides = nil
+		m.slideMode = false
+		m.currentSlide = 0
 		return m, loadLocalMarkdown(&m.currentDocument)
 
 	// We've finished editing the document, potentially making changes. Let's
 	// retrieve the latest version of the document so that we display
 	// up-to-date contents.
 	case editorFinishedMsg:
+		m.slides = nil
+		m.slideMode = false
+		m.currentSlide = 0
 		return m, loadLocalMarkdown(&m.currentDocument)
 
 	// We've received terminal dimensions, either for the first time or
 	// after a resize
 	case tea.WindowSizeMsg:
+		// Parse slides if we haven't already and presentation mode is enabled
+		if len(m.slides) == 0 && m.currentDocument.Body != "" {
+			m.parseSlides()
+		}
+
+		// Render the current slide if in slide mode, otherwise full content
+		if m.slideMode && len(m.slides) > 0 {
+			return m, renderWithGlamour(m, m.slides[m.currentSlide])
+		}
 		return m, renderWithGlamour(m, m.currentDocument.Body)
 
 	case statusMessageTimeoutMsg:
@@ -328,6 +375,11 @@ func (m pagerModel) statusBarView(b *strings.Builder) {
 		note = m.statusMessage
 	} else {
 		note = m.currentDocument.Note
+		// Add slide indicator if in slide mode
+		if m.slideMode && len(m.slides) > 0 {
+			slideIndicator := fmt.Sprintf(" [Slide %d/%d]", m.currentSlide+1, len(m.slides))
+			note = note + slideIndicator
+		}
 	}
 	note = truncate.StringWithTail(" "+note+" ", uint(max(0, //nolint:gosec
 		m.common.width-
@@ -369,6 +421,8 @@ func (m pagerModel) helpView() (s string) {
 	col1 := []string{
 		"g/home  go to top",
 		"G/end   go to bottom",
+		"n       next slide",
+		"p       previous slide",
 		"c       copy contents",
 		"e       edit this document",
 		"r       reload this document",
@@ -382,10 +436,14 @@ func (m pagerModel) helpView() (s string) {
 	s += "b/pgup   page up             " + col1[2] + "\n"
 	s += "f/pgdn   page down           " + col1[3] + "\n"
 	s += "u        ½ page up           " + col1[4] + "\n"
-	s += "d        ½ page down         "
+	s += "d        ½ page down         " + col1[5] + "\n"
+	s += "                             " + col1[6]
 
-	if len(col1) > 5 {
-		s += col1[5]
+	if len(col1) > 7 {
+		s += "\n                             " + col1[7]
+	}
+	if len(col1) > 8 {
+		s += "\n                             " + col1[8]
 	}
 
 	s = indent(s, 2)
@@ -403,6 +461,113 @@ func (m pagerModel) helpView() (s string) {
 	}
 
 	return helpViewStyle(s)
+}
+
+// parseSlides splits the markdown into individual slides based on numbered H1 headers.
+// Each slide contains one H1 header and all content until the next H1 header.
+// Only activates if PresentationMode is enabled in config.
+func (m *pagerModel) parseSlides() {
+	m.slides = []string{}
+	m.slideMode = false
+
+	// Only parse slides if presentation mode is enabled
+	if !m.common.cfg.PresentationMode {
+		return
+	}
+
+	if m.currentDocument.Body == "" {
+		return
+	}
+
+	lines := strings.Split(m.currentDocument.Body, "\n")
+	var currentSlideLines []string
+	foundNumberedH1 := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Check if this is a numbered H1 header
+		isNumberedH1 := false
+		if after, ok := strings.CutPrefix(trimmed, "# "); ok {
+			headerText := after
+			headerText = strings.TrimSpace(headerText)
+
+			// Check if it starts with a number
+			if len(headerText) > 0 && headerText[0] >= '0' && headerText[0] <= '9' {
+				isNumberedH1 = true
+				foundNumberedH1 = true
+			}
+		}
+
+		// If we hit a new numbered H1 and we have accumulated content, save the slide
+		if isNumberedH1 && len(currentSlideLines) > 0 {
+			m.slides = append(m.slides, strings.Join(currentSlideLines, "\n"))
+			currentSlideLines = []string{}
+		}
+
+		// Add line to current slide if we're in slide mode
+		if foundNumberedH1 {
+			currentSlideLines = append(currentSlideLines, line)
+		}
+	}
+
+	// Don't forget the last slide
+	if len(currentSlideLines) > 0 {
+		m.slides = append(m.slides, strings.Join(currentSlideLines, "\n"))
+	}
+
+	if len(m.slides) > 0 {
+		m.slideMode = true
+		m.currentSlide = 0
+		m.originalContent = m.currentDocument.Body
+		log.Info("slide mode enabled", "slides", len(m.slides))
+	} else {
+		log.Debug("no numbered h1 headers found - slide mode disabled")
+	}
+}
+
+// nextPage navigates to the next slide.
+func (m *pagerModel) nextPage() tea.Cmd {
+	if !m.slideMode {
+		m.parseSlides()
+	}
+
+	if !m.slideMode || len(m.slides) == 0 {
+		log.Debug("no slides found for navigation")
+		return nil
+	}
+
+	if m.currentSlide < len(m.slides)-1 {
+		m.currentSlide++
+		m.resetScrollPosition = true
+		log.Debug("navigating to next slide", "slide", m.currentSlide+1, "total", len(m.slides))
+		return renderWithGlamour(*m, m.slides[m.currentSlide])
+	}
+
+	log.Debug("already at last slide")
+	return nil
+}
+
+// previousPage navigates to the previous slide.
+func (m *pagerModel) previousPage() tea.Cmd {
+	if !m.slideMode {
+		m.parseSlides()
+	}
+
+	if !m.slideMode || len(m.slides) == 0 {
+		log.Debug("no slides found for navigation")
+		return nil
+	}
+
+	if m.currentSlide > 0 {
+		m.currentSlide--
+		m.resetScrollPosition = true
+		log.Debug("navigating to previous slide", "slide", m.currentSlide+1, "total", len(m.slides))
+		return renderWithGlamour(*m, m.slides[m.currentSlide])
+	}
+
+	log.Debug("already at first slide")
+	return nil
 }
 
 // COMMANDS

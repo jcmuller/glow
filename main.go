@@ -38,6 +38,7 @@ var (
 	configFile       string
 	pager            bool
 	tui              bool
+	presentation     bool
 	style            string
 	width            uint
 	showAllFiles     bool
@@ -170,12 +171,21 @@ func validateOptions(cmd *cobra.Command) error {
 	mouse = viper.GetBool("mouse")
 	pager = viper.GetBool("pager")
 	tui = viper.GetBool("tui")
+	presentation = viper.GetBool("presentation")
 	showAllFiles = viper.GetBool("all")
 	preserveNewLines = viper.GetBool("preserveNewLines")
 	showLineNumbers = viper.GetBool("showLineNumbers")
 
 	if pager && tui {
 		return errors.New("cannot use both pager and tui")
+	}
+
+	if pager && presentation {
+		return errors.New("presentation mode cannot be used with pager mode")
+	}
+
+	if presentation && !tui {
+		tui = true
 	}
 
 	// validate the glamour style
@@ -364,6 +374,7 @@ func runTUI(path string, content string) error {
 	cfg.GlamourMaxWidth = width
 	cfg.EnableMouse = mouse
 	cfg.PreserveNewLines = preserveNewLines
+	cfg.PresentationMode = presentation
 
 	// Run Bubble Tea program
 	if _, err := ui.NewProgram(cfg, content).Run(); err != nil {
@@ -402,6 +413,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&configFile, "config", "", fmt.Sprintf("config file (default %s)", viper.GetViper().ConfigFileUsed()))
 	rootCmd.Flags().BoolVarP(&pager, "pager", "p", false, "display with pager")
 	rootCmd.Flags().BoolVarP(&tui, "tui", "t", false, "display with tui")
+	rootCmd.Flags().BoolVarP(&presentation, "presentation", "P", false, "display in presentation mode (TUI-mode only)")
 	rootCmd.Flags().StringVarP(&style, "style", "s", styles.AutoStyle, "style name or JSON path")
 	rootCmd.Flags().UintVarP(&width, "width", "w", 0, "word-wrap at width (set to 0 to disable)")
 	rootCmd.Flags().BoolVarP(&showAllFiles, "all", "a", false, "show system files and directories (TUI-mode only)")
@@ -413,6 +425,7 @@ func init() {
 	// Config bindings
 	_ = viper.BindPFlag("pager", rootCmd.Flags().Lookup("pager"))
 	_ = viper.BindPFlag("tui", rootCmd.Flags().Lookup("tui"))
+	_ = viper.BindPFlag("presentation", rootCmd.Flags().Lookup("presentation"))
 	_ = viper.BindPFlag("style", rootCmd.Flags().Lookup("style"))
 	_ = viper.BindPFlag("width", rootCmd.Flags().Lookup("width"))
 	_ = viper.BindPFlag("debug", rootCmd.Flags().Lookup("debug"))

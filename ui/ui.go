@@ -190,13 +190,9 @@ func (m model) Init() tea.Cmd {
 	case stateShowStash:
 		cmds = append(cmds, findLocalFiles(*m.common))
 	case stateShowDocument:
-		content, err := os.ReadFile(m.common.cfg.Path)
-		if err != nil {
-			log.Error("unable to read file", "file", m.common.cfg.Path, "error", err)
-			return func() tea.Msg { return errMsg{err} }
-		}
-		body := string(utils.RemoveFrontmatter(content))
-		cmds = append(cmds, renderWithGlamour(m.pager, body))
+		// Use the existing loadLocalMarkdown which will trigger fetchedMarkdownMsg
+		// where slide parsing happens
+		cmds = append(cmds, loadLocalMarkdown(&m.pager.currentDocument))
 	}
 
 	return tea.Batch(cmds...)
@@ -276,7 +272,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// We've loaded a markdown file's contents for rendering
 		m.pager.currentDocument = *msg
 		body := string(utils.RemoveFrontmatter([]byte(msg.Body)))
-		cmds = append(cmds, renderWithGlamour(m.pager, body))
+
+		// Update the document body to have frontmatter removed before parsing
+		m.pager.currentDocument.Body = body
+
+		// Parse slides to check if we should enter slide mode
+		m.pager.parseSlides()
+
+		// Render the first slide if in slide mode, otherwise render full content
+		if m.pager.slideMode && len(m.pager.slides) > 0 {
+			cmds = append(cmds, renderWithGlamour(m.pager, m.pager.slides[0]))
+		} else {
+			cmds = append(cmds, renderWithGlamour(m.pager, body))
+		}
 
 	case contentRenderedMsg:
 		m.state = stateShowDocument
